@@ -1,12 +1,14 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Plays a looping walking sound while the player walks and a running sound
-/// while they sprint (Left Shift). Stops when standing still or in the air.
-/// Checks the ground tag under the player (e.g. Dirt, Stone) and uses that
-/// surface's sounds and playback speeds. Untagged ground uses the defaults below.
+/// Plays looping walking / running footsteps while the player moves on the ground.
+/// The surface is picked in this order:
+///   1. Water      - the player is inside a trigger collider tagged "Water" (e.g. a plane with a Box Collider set to Is Trigger)
+///   2. Terrain    - the ground is a Terrain: the strongest texture layer under the player is used (matched by Terrain Layer asset name)
+///   3. Tag        - any other ground: the object's tag (or the nearest tagged parent) is used
+///   4. Default    - the default sounds below
 /// Attach to the Player (the object with the CharacterController).
-/// Doesn't touch PlayerMovement.cs - it just watches the controller's speed.
 /// </summary>
 [RequireComponent(typeof(CharacterController))]
 public class PlayerFootsteps : MonoBehaviour
@@ -14,7 +16,8 @@ public class PlayerFootsteps : MonoBehaviour
     [System.Serializable]
     public class Surface
     {
-        public string tag;              // ground object tag, e.g. "Dirt" or "Stone"
+        [Tooltip("Object tag (e.g. Stone, Water) OR the exact name of a Terrain Layer asset (e.g. Grass, Dirt). Case-insensitive.")]
+        public string tag;
         public AudioClip walkSound;     // loopable footsteps on this surface
         public AudioClip runSound;      // faster loopable footsteps on this surface
 
@@ -25,9 +28,9 @@ public class PlayerFootsteps : MonoBehaviour
         [Range(0f, 3f)] public float runPlaybackSpeed = 1.3f;
     }
 
-    [Header("Default Sounds (used when the ground has no matching tag)")]
-    [SerializeField] private AudioClip walkSound;   // loopable footsteps
-    [SerializeField] private AudioClip runSound;    // faster loopable footsteps
+    [Header("Default Sounds (used when nothing matches)")]
+    [SerializeField] private AudioClip walkSound;
+    [SerializeField] private AudioClip runSound;
     [SerializeField, Range(0f, 1f)] private float volume = 0.7f;
 
     [Header("Surfaces")]
@@ -36,17 +39,21 @@ public class PlayerFootsteps : MonoBehaviour
     [Header("Default Playback Speed (used when no surface matches, or a surface speed is 0)")]
     [SerializeField, Range(0.5f, 3f)] private float walkPlaybackSpeed = 1f;
     [SerializeField, Range(0.5f, 3f)] private float runPlaybackSpeed = 1.3f;
-    [SerializeField, Range(0.5f, 3f)] private float crouchPitch = 0.7f;       // slower/softer when crouching
+    [SerializeField, Range(0.5f, 3f)] private float crouchPitch = 0.7f;
 
     [Header("Settings")]
     [SerializeField] private KeyCode sprintKey = KeyCode.LeftShift;
     [SerializeField] private KeyCode crouchKey = KeyCode.LeftControl;
-    [SerializeField] private float minMoveSpeed = 0.1f;      // above this = moving
-    [SerializeField] private float stopDelay = 0.15f;        // keeps sound going through brief speed dips
-    [SerializeField] private float airGrace = 0.1f;          // avoids stutter on tiny bumps
+    [SerializeField] private float minMoveSpeed = 0.1f;
+    [SerializeField] private float stopDelay = 0.15f;
+    [SerializeField] private float airGrace = 0.1f;
+
+    [Header("Water")]
+    [Tooltip("Tag of the trigger collider that counts as water. Must exist in the Tag Manager.")]
+    [SerializeField] private string waterTag = "Water";
 
     [Header("Ground Check")]
-    [SerializeField] private bool debug = true;   // prints status + ground info in the Console
+    [SerializeField] private bool debug = true;
     [SerializeField] private float rayStartHeight = 0.5f;
     [SerializeField] private float rayLength = 1.5f;
     [SerializeField] private LayerMask groundMask = ~0;
@@ -58,6 +65,9 @@ public class PlayerFootsteps : MonoBehaviour
     private string lastLoggedGround = "";
     private bool warnedNoClip;
 
+    // Water trigger colliders the player is currently inside
+    private readonly HashSet<Collider> waterZones = new HashSet<Collider>();
+
     private void Awake()
     {
         cc = GetComponent<CharacterController>();
@@ -65,7 +75,7 @@ public class PlayerFootsteps : MonoBehaviour
         source = gameObject.AddComponent<AudioSource>();
         source.loop = true;
         source.playOnAwake = false;
-        source.spatialBlend = 0f;   // 2D so it doesn't fade with camera distance
+        source.spatialBlend = 0f;
         source.volume = volume;
     }
 
@@ -82,9 +92,11 @@ public class PlayerFootsteps : MonoBehaviour
 
     private void OnDisable()
     {
-        // Silence footsteps when this script is switched off (e.g. during ragdoll)
+        waterZones.Clear();
         if (source != null) source.Stop();
     }
+
+    // ---------------- Main loop ----------------
 
     private void Update()
     {
@@ -110,11 +122,8 @@ public class PlayerFootsteps : MonoBehaviour
         Vector3 flat = new Vector3(cc.velocity.x, 0f, cc.velocity.z);
         bool movingNow = flat.magnitude > minMoveSpeed;
         if (movingNow) lastMovingTime = Time.time;
-
-        // Counts as moving for a short moment after the last movement, so speed flicker doesn't cut the sound
         bool moving = Time.time - lastMovingTime <= stopDelay;
 
-        // Status line, twice a second
         if (debug && Time.frameCount % 30 == 0)
         {
             Debug.Log("[Footsteps] speed=" + flat.magnitude.ToString("F2") +
@@ -138,24 +147,21 @@ public class PlayerFootsteps : MonoBehaviour
         AudioClip wanted = GetClip(running, out float surfacePlaybackSpeed);
         if (wanted == null)
         {
-            // Warn once instead of failing silently
             if (!warnedNoClip)
             {
-                Debug.LogWarning("Footsteps: no clip found. Assign a default Walk Sound on the Player, or check the ground tag / Surfaces list.", this);
+                Debug.LogWarning("Footsteps: no clip found. Assign a default Walk Sound on the Player, or check the Surfaces list.", this);
                 warnedNoClip = true;
             }
             return;
         }
         warnedNoClip = false;
 
-        // Playback speed: crouch overrides, otherwise use this surface's walk/run speed
         float targetPitch = crouching ? crouchPitch : surfacePlaybackSpeed;
 
         source.mute = false;
         source.pitch = targetPitch;
         source.volume = volume;
 
-        // Switch clips only when needed so it doesn't restart every frame
         if (source.clip != wanted)
         {
             source.clip = wanted;
@@ -168,6 +174,8 @@ public class PlayerFootsteps : MonoBehaviour
             if (debug) Debug.Log("[Footsteps] Play() restarted '" + wanted.name + "' isPlaying=" + source.isPlaying, this);
         }
     }
+
+    // ---------------- Helpers ----------------
 
     // Finds any assigned clip, used only by the P test
     private AudioClip FindAnyClip()
@@ -185,7 +193,7 @@ public class PlayerFootsteps : MonoBehaviour
         return null;
     }
 
-    // Casts down and returns the closest hit that is NOT part of the player itself
+    // Casts down and returns the closest solid hit that is NOT part of the player itself
     private bool TryGetGround(Vector3 origin, out RaycastHit result)
     {
         RaycastHit[] hits = Physics.RaycastAll(origin, Vector3.down, rayLength, groundMask, QueryTriggerInteraction.Ignore);
@@ -195,7 +203,7 @@ public class PlayerFootsteps : MonoBehaviour
 
         foreach (RaycastHit h in hits)
         {
-            if (h.collider.transform.IsChildOf(transform)) continue;   // skip the player's own colliders
+            if (h.collider.transform.IsChildOf(transform)) continue;
             if (h.distance < best)
             {
                 best = h.distance;
@@ -217,7 +225,88 @@ public class PlayerFootsteps : MonoBehaviour
         return "Untagged";
     }
 
-    // Looks at the ground under the player and picks the clip and playback speed for that surface
+    // Blend of every terrain texture layer at a world position (values add up to ~1)
+    private float[] GetTerrainCellMix(Vector3 worldPos, Terrain terrain)
+    {
+        TerrainData data = terrain.terrainData;
+        Vector3 terrainPos = terrain.transform.position;
+
+        // World position -> 0..1 across the terrain -> alphamap pixel
+        float relX = (worldPos.x - terrainPos.x) / data.size.x;
+        float relZ = (worldPos.z - terrainPos.z) / data.size.z;
+
+        int mapX = Mathf.Clamp((int)(relX * data.alphamapWidth), 0, data.alphamapWidth - 1);
+        int mapZ = Mathf.Clamp((int)(relZ * data.alphamapHeight), 0, data.alphamapHeight - 1);
+
+        // Result is indexed [z, x, layer]
+        float[,,] splat = data.GetAlphamaps(mapX, mapZ, 1, 1);
+
+        float[] mix = new float[splat.GetLength(2)];
+        for (int i = 0; i < mix.Length; i++)
+            mix[i] = splat[0, 0, i];
+        return mix;
+    }
+
+    // Name of the strongest terrain layer at a world position, or null if there is none
+    private string GetTerrainLayerName(Vector3 worldPos, Terrain terrain)
+    {
+        TerrainLayer[] layers = terrain.terrainData.terrainLayers;
+        if (layers == null || layers.Length == 0) return null;
+
+        float[] mix = GetTerrainCellMix(worldPos, terrain);
+        int maxIndex = 0;
+        float strongest = 0f;
+        for (int i = 0; i < mix.Length; i++)
+        {
+            if (mix[i] > strongest)
+            {
+                strongest = mix[i];
+                maxIndex = i;
+            }
+        }
+
+        if (maxIndex >= layers.Length || layers[maxIndex] == null) return null;
+        return layers[maxIndex].name;
+    }
+
+    // Figures out which surface name (water, terrain layer or tag) the player is on
+    private string GetSurfaceName()
+    {
+        Vector3 origin = transform.position + Vector3.up * rayStartHeight;
+        if (!TryGetGround(origin, out RaycastHit hit))
+        {
+            if (debug && lastLoggedGround != "NO GROUND")
+            {
+                Debug.Log("Footsteps: ray hit nothing. Check groundMask, rayLength, and that the floor has a collider.");
+                lastLoggedGround = "NO GROUND";
+            }
+            return null;
+        }
+
+        string surfaceName = FindTag(hit.collider.transform);
+
+        // Standing on a Terrain: use its strongest texture layer instead of the tag
+        Terrain terrain = hit.collider.GetComponent<Terrain>();
+        if (terrain != null)
+        {
+            string layerName = GetTerrainLayerName(hit.point, terrain);
+            if (!string.IsNullOrEmpty(layerName)) surfaceName = layerName;
+        }
+
+        if (debug)
+        {
+            string msg = "Footsteps: ground = '" + hit.collider.name + "', surface = '" + surfaceName + "'";
+            if (msg != lastLoggedGround)
+            {
+                Debug.Log(msg);
+                lastLoggedGround = msg;
+            }
+        }
+
+        return surfaceName;
+    }
+
+    // Picks the clip and playback speed for the current surface
     private AudioClip GetClip(bool running, out float playbackSpeed)
     {
         AudioClip walk = walkSound;
@@ -225,43 +314,24 @@ public class PlayerFootsteps : MonoBehaviour
         float walkSpeed = walkPlaybackSpeed;
         float runSpeed = runPlaybackSpeed;
 
-        Vector3 origin = transform.position + Vector3.up * rayStartHeight;
-        if (TryGetGround(origin, out RaycastHit hit))
+        string surfaceName = GetSurfaceName();
+
+        if (surfaceName != null && surfaces != null)
         {
-            string groundTag = FindTag(hit.collider.transform);
-
-            if (debug)
+            foreach (Surface s in surfaces)
             {
-                string msg = "Footsteps: ground = '" + hit.collider.name + "', tag = '" + groundTag + "'";
-                if (msg != lastLoggedGround)
+                if (string.Equals(s.tag, surfaceName, System.StringComparison.OrdinalIgnoreCase))
                 {
-                    Debug.Log(msg);
-                    lastLoggedGround = msg;
-                }
-            }
-
-            if (surfaces != null)
-            {
-                foreach (Surface s in surfaces)
-                {
-                    if (string.Equals(s.tag, groundTag, System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (s.walkSound != null) walk = s.walkSound;
-                        if (s.runSound != null) run = s.runSound;
-                        if (s.walkPlaybackSpeed > 0f) walkSpeed = s.walkPlaybackSpeed;
-                        if (s.runPlaybackSpeed > 0f) runSpeed = s.runPlaybackSpeed;
-                        break;
-                    }
+                    if (s.walkSound != null) walk = s.walkSound;
+                    if (s.runSound != null) run = s.runSound;
+                    if (s.walkPlaybackSpeed > 0f) walkSpeed = s.walkPlaybackSpeed;
+                    if (s.runPlaybackSpeed > 0f) runSpeed = s.runPlaybackSpeed;
+                    break;
                 }
             }
         }
-        else if (debug && lastLoggedGround != "NO GROUND")
-        {
-            Debug.Log("Footsteps: ray hit nothing. Check groundMask, rayLength, and that the floor has a collider.");
-            lastLoggedGround = "NO GROUND";
-        }
 
-        // If running but this surface has no run clip, we fall back to the walk clip, so use the walk speed
+        // Running but no run clip on this surface: fall back to walk clip with the walk speed
         if (running && run != null)
         {
             playbackSpeed = runSpeed;
